@@ -1,0 +1,53 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d target;
+uniform texture2d luma_mask;
+uniform float progress;
+uniform bool invert;
+uniform float softness;
+
+sampler_state textureSampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in) {
+    VertData v_out;
+    v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    v_out.uv  = v_in.uv;
+    return v_out;
+}
+
+float4 PSLumaWipe(VertData v_in) : TARGET {
+    float4 rgba_a = image.Sample(textureSampler, v_in.uv);
+    float4 rgba_b = target.Sample(textureSampler, v_in.uv);
+    
+    float mask_val = luma_mask.Sample(textureSampler, v_in.uv).r;
+    
+    if (invert) {
+        mask_val = 1.0 - mask_val;
+    }
+    
+    // The core logic:
+    // If progress >= mask_val, show Source B.
+    // If progress < mask_val, show Source A.
+    // We use smoothstep for softness.
+    
+    float s = max(0.001, softness);
+    float alpha = smoothstep(mask_val - s, mask_val, progress);
+    
+    return lerp(rgba_a, rgba_b, alpha);
+}
+
+technique LumaWipe {
+    pass P0 {
+        VertexShader = VSDefault();
+        PixelShader  = PSLumaWipe();
+    }
+}

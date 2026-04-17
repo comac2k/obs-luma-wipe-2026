@@ -1,59 +1,64 @@
-# OBS Plugin Template
+# Luma Wipe Transition for OBS (C)
 
-## Introduction
+> [!WARNING]
+> **UNFINISHED PROJECT:** This project is currently under active development. It may not work, may not even build, and could cause OBS to crash. The codebase and features may change unexpectedly overnight. Use at your own risk.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+## Why this exists?
+This plugin is designed as a modern overhaul of the built-in OBS luma-wipe transition. The original implementation:
+- Dates back to the early 2010s.
+- Relies on low-resolution 480p images in 4:3 aspect ratio.
+- Has not received significant updates in over a decade.
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+**Luma Wipe 2026** aims to bring this classic transition into the modern era with high-fidelity assets and advanced rendering features.
 
-## Supported Build Environments
+## Key Improvements
+- **16-bit Accuracy:** Full support for 16-bit grayscale PNG masks to eliminate "stepping" or "banding" during slow transitions.
+- **Native Motion Blur (WIP):** High-quality temporal smoothing for more dynamic wipes.
+- **Modern Aspect Ratios:** Optimized for 16:9 HD workflows.
+- **Advanced Fitting Algorithms (WIP):** Multiple ways to handle mask scaling (Stretch, Cover).
+- **HD Asset Library (WIP):** A new set of high-definition 16:9 transition masks.
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+## Features
+- **Mask-based timing:** Pixel value in the mask determines when the switch from Source A to Source B occurs.
+- **High bit-depth support:** Preserves 16-bit accuracy for smooth transitions.
+- **Softness control:** Adjustable edge softness using smoothstep.
+- **Inversion:** Option to invert the mask behavior.
+- **Native Performance:** Built as a C plugin for optimal integration with OBS Studio.
 
-## Quick Start
+## Installation
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+### Building from Source
+This plugin uses CMake and follows the standard OBS plugin template structure.
 
-## Documentation
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/comac2k/obs-luma-wipe-2026.git
+    cd obs-luma-wipe-2026
+    ```
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+2.  **Generate build files:**
+    ```bash
+    cmake -B build -S .
+    ```
 
-Suggested reading to get up and running:
+3.  **Build and Install:**
+    ```bash
+    cmake --build build --config Release
+    ```
+    *Note: You may need to specify your OBS installation path or copy the resulting binaries manually to your OBS plugins folder.*
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+## Usage
+1.  Open OBS Studio.
+2.  In the **Scene Transitions** dock (or the transition dropdown), click the `+` button to add a new transition.
+3.  Select **Luma Wipe 2026**.
+4.  In the transition properties, select a grayscale image as your **Luma Mask Image**.
+    - Black (0%) = Transitions immediately.
+    - White (100%) = Transitions at the very end.
+    - 16-bit PNG images are recommended for the smoothest results.
+5.  Adjust **Softness** and **Invert Mask** as needed.
 
-## GitHub Actions & CI
-
-Default GitHub Actions workflows are available for the following repository actions:
-
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
-
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
-
-### Retrieving build artifacts
-
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
-
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+## Technical Details
+- **Plugin ID:** `luma_wipe_2026`
+- **Logic:** Pixel value `V` (0.0 to 1.0) means the switch occurs at `T = V`.
+- **Shader:** Uses `luma_wipe.effect` (HLSL) for GPU-accelerated rendering.
+- **Transition Formula:** `lerp(SourceA, SourceB, smoothstep(V - softness, V, progress))`.
