@@ -1,8 +1,8 @@
-#include <obs-module.h>
 #include <graphics/image-file.h>
-#include <util/platform.h>
-#include <util/dstr.h>
 #include <graphics/matrix4.h>
+#include <obs-module.h>
+#include <util/dstr.h>
+#include <util/platform.h>
 
 struct luma_wipe_info {
 	obs_source_t *source;
@@ -39,8 +39,9 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	filter->softness = obs_data_get_double(settings, "softness");
 	filter->motion_blur_bias = obs_data_get_double(settings, "motion_blur_bias");
 
-	if (filter->mask_path && path && strcmp(filter->mask_path, path) == 0)
+	if (filter->mask_path && path && strcmp(filter->mask_path, path) == 0) {
 		return;
+	}
 
 	bfree(filter->mask_path);
 	filter->mask_path = (path && *path) ? bstrdup(path) : NULL;
@@ -71,7 +72,7 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 		obs_enter_graphics();
 		filter->effect = gs_effect_create_from_file(effect_path, &error_string);
 		obs_leave_graphics();
-		
+
 		if (filter->effect) {
 			filter->param_image = gs_effect_get_param_by_name(filter->effect, "image");
 			filter->param_target = gs_effect_get_param_by_name(filter->effect, "target");
@@ -90,7 +91,8 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 		}
 		bfree(effect_path);
 	} else {
-		blog(LOG_ERROR, "[Luma Wipe 2026] Could not find luma_wipe.effect. Please ensure it is in the plugin's data directory (usually data/obs-plugins/luma-wipe-2026/).");
+		blog(LOG_ERROR, "[Luma Wipe 2026] Could not find luma_wipe.effect. Please ensure it is in the plugin's "
+				"data directory (usually data/obs-plugins/luma-wipe-2026/).");
 	}
 
 	luma_wipe_update(filter, settings);
@@ -104,8 +106,9 @@ static void luma_wipe_destroy(void *data)
 
 	obs_enter_graphics();
 	gs_image_file_free(&filter->mask_image);
-	if (filter->effect)
+	if (filter->effect) {
 		gs_effect_destroy(filter->effect);
+	}
 	obs_leave_graphics();
 
 	bfree(filter->mask_path);
@@ -120,9 +123,9 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 		// Fallback: simple crossfade if no mask or no effect
 		gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 		gs_eparam_t *param = gs_effect_get_param_by_name(default_effect, "image");
-		
+
 		gs_effect_set_texture(param, (t < 0.5f) ? a : b);
-		
+
 		while (gs_effect_loop(default_effect, "Draw")) {
 			gs_draw_sprite(NULL, 0, cx, cy);
 		}
@@ -138,10 +141,12 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	gs_effect_set_float(filter->param_progress, t);
 	gs_effect_set_bool(filter->param_invert, filter->invert);
 	gs_effect_set_float(filter->param_softness, (float)filter->softness);
-	if (filter->param_bias)
+	if (filter->param_bias) {
 		gs_effect_set_float(filter->param_bias, (float)filter->motion_blur_bias);
-	if (filter->param_viewproj)
+	}
+	if (filter->param_viewproj) {
 		gs_effect_set_matrix4(filter->param_viewproj, &projection);
+	}
 
 	while (gs_effect_loop(filter->effect, "LumaWipe")) {
 		gs_draw_sprite(NULL, 0, cx, cy);
@@ -179,7 +184,7 @@ static obs_properties_t *luma_wipe_get_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
-	
+
 	char *lumas_path = obs_module_file("lumas");
 	obs_properties_add_path(props, "mask_path", obs_module_text("MaskPath"), OBS_PATH_FILE,
 				obs_module_text("FilterFiles"), lumas_path);

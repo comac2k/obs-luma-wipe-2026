@@ -25,24 +25,26 @@ VertData VSDefault(VertData v_in) {
     return v_out;
 }
 
-float4 PSLumaWipe(VertData v_in) : S_TARGET {
+float4 PSLumaWipe(VertData v_in) : TARGET {
     float4 rgba_a = image.Sample(textureSampler, v_in.uv);
     float4 rgba_b = target.Sample(textureSampler, v_in.uv);
     
-    float mask_val = luma_mask.Sample(textureSampler, v_in.uv).r;
+    float luma = luma_mask.Sample(textureSampler, v_in.uv).r;
     
     if (invert) {
-        mask_val = 1.0 - mask_val;
+        luma = 1.0 - luma;
     }
     
-    // The core logic:
-    // If progress >= mask_val, show Source B.
-    // If progress < mask_val, show Source A.
-    // We use smoothstep for softness.
-    
+    // Improved softness logic from OBS source
+    float time = lerp(0.0f, 1.0f + softness, progress);
     float s = max(0.001, softness);
-    float alpha = smoothstep(mask_val - s, mask_val, progress);
     
+    if (luma <= time - s)
+        return rgba_b;
+    if (luma >= time)
+        return rgba_a;
+        
+    float alpha = (time - luma) / s;
     return lerp(rgba_a, rgba_b, alpha);
 }
 
