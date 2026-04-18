@@ -5,6 +5,11 @@
 #include <util/dstr.h>
 #include <util/platform.h>
 
+enum scaling_method {
+	SCALING_STRETCH,
+	SCALING_CROP
+};
+
 struct luma_wipe_info {
 	obs_source_t *source;
 	gs_effect_t *effect;
@@ -19,11 +24,16 @@ struct luma_wipe_info {
 	gs_eparam_t *param_blur_window;
 	gs_eparam_t *param_flip_x;
 	gs_eparam_t *param_flip_y;
+	gs_eparam_t *param_mask_uv_scale;
 
 	gs_texture_t *mask_texture;
+	uint32_t mask_width;
+	uint32_t mask_height;
+
 	bool invert;
 	bool flip_x;
 	bool flip_y;
+	enum scaling_method scaling;
 	double motion_blur_bias;
 	float last_t;
 	char *mask_path;
@@ -44,6 +54,7 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	filter->flip_x = obs_data_get_bool(settings, "flip_x");
 	filter->flip_y = obs_data_get_bool(settings, "flip_y");
 	filter->motion_blur_bias = obs_data_get_double(settings, "motion_blur_bias");
+	filter->scaling = (enum scaling_method)obs_data_get_int(settings, "scaling_method");
 
 	if (filter->mask_path && path && strcmp(filter->mask_path, path) == 0) {
 		return;
@@ -56,6 +67,8 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	if (filter->mask_texture) {
 		gs_texture_destroy(filter->mask_texture);
 		filter->mask_texture = NULL;
+		filter->mask_width = 0;
+		filter->mask_height = 0;
 	}
 
 	if (filter->mask_path) {
@@ -63,6 +76,8 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 		unsigned short *image_data = stbi_load_16(filter->mask_path, &width, &height, &channels, 1);
 		if (image_data) {
 			filter->mask_texture = gs_texture_create(width, height, GS_R16, 1, (const uint8_t **)&image_data, 0);
+			filter->mask_width = (uint32_t)width;
+			filter->mask_height = (uint32_t)height;
 			stbi_image_free(image_data);
 		} else {
 			blog(LOG_WARNING, "[Luma Wipe 2026] Failed to load mask: %s", filter->mask_path);
@@ -77,6 +92,7 @@ static void luma_wipe_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "invert", false);
 	obs_data_set_default_bool(settings, "flip_x", false);
 	obs_data_set_default_bool(settings, "flip_y", false);
+	obs_data_set_default_int(settings, "scaling_method", SCALING_CROP);
 }
 
 static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
@@ -102,6 +118,7 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 			filter->param_blur_window = gs_effect_get_param_by_name(filter->effect, "blur_window");
 			filter->param_flip_x = gs_effect_get_param_by_name(filter->effect, "flip_x");
 			filter->param_flip_y = gs_effect_get_param_by_name(filter->effect, "flip_y");
+			filter->param_mask_uv_scale = gs_effect_get_param_by_name(filter->effect, "mask_uv_scale");
 		} else {
 			blog(LOG_ERROR, "[Luma Wipe 2026] Effect file found but could not be loaded: %s", effect_path);
 			if (error_string) {
@@ -190,6 +207,20 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	struct matrix4 projection;
 	gs_matrix_get(&projection);
 
+	float mask_uv_scale[2] = {1.0f, 1.0f};
+	if (filter->scaling == SCALING_CROP && filter->mask_width > 0 && filter->mask_height > 0) {
+		float source_aspect = (float)cx / (float)cy;
+		float mask_aspect = (float)filter->mask_width / (float)filter->mask_height;
+
+		if (source_aspect > mask_aspect) {
+			mask_uv_scale[0] = 1.0f;
+			mask_uv_scale[1] = mask_aspect / source_aspect;
+		} else {
+			mask_uv_scale[0] = source_aspect / mask_aspect;
+			mask_uv_scale[1] = 1.0f;
+		}
+	}
+
 	gs_effect_set_texture(filter->param_image, a);
 	gs_effect_set_texture(filter->param_target, b);
 	gs_effect_set_texture(filter->param_mask, filter->mask_texture);
@@ -209,6 +240,9 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	}
 	if (filter->param_flip_y) {
 		gs_effect_set_bool(filter->param_flip_y, filter->flip_y);
+	}
+	if (filter->param_mask_uv_scale) {
+		gs_effect_set_vec2(filter->param_mask_uv_scale, (const struct vec2 *)mask_uv_scale);
 	}
 
 	while (gs_effect_loop(filter->effect, "LumaWipe")) {
@@ -256,6 +290,12 @@ static obs_properties_t *luma_wipe_get_properties(void *data)
 	obs_properties_add_bool(props, "invert", obs_module_text("Invert"));
 	obs_properties_add_bool(props, "flip_x", obs_module_text("FlipX"));
 	obs_properties_add_bool(props, "flip_y", obs_module_text("FlipY"));
+
+	obs_property_t *p = obs_properties_add_list(props, "scaling_method", obs_module_text("ScalingMethod"),
+						    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Scaling.Stretch"), SCALING_STRETCH);
+	obs_property_list_add_int(p, obs_module_text("Scaling.Crop"), SCALING_CROP);
+
 	obs_properties_add_float_slider(props, "motion_blur_bias", obs_module_text("MotionBlurBias"), -1.0, 1.0, 0.01);
 
 	return props;

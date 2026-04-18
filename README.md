@@ -13,16 +13,16 @@ This plugin is designed as a modern overhaul of the built-in OBS luma-wipe trans
 
 ## Key Improvements
 - **16-bit Accuracy:** Full support for 16-bit grayscale PNG masks to eliminate "stepping" or "banding" during slow transitions.
-- **Native Motion Blur (WIP):** High-quality temporal smoothing for more dynamic wipes.
-- **Modern Aspect Ratios:** Optimized for 16:9 HD workflows.
-- **Advanced Fitting Algorithms (WIP):** Multiple ways to handle mask scaling (Stretch, Cover).
+- **Native Motion Blur:** High-quality temporal smoothing for more dynamic wipes.
+- **Modern Aspect Ratios:** Optimized for 16:9 HD and UHD workflows.
+- **Advanced Fitting Algorithms:** Support for "Stretch" and "Crop" scaling methods to handle mismatched aspect ratios.
 - **HD Asset Library (WIP):** A new set of high-definition 16:9 transition masks.
 
 ## Features
 - **Mask-based timing:** Pixel value in the mask determines when the switch from Source A to Source B occurs.
 - **High bit-depth support:** Preserves 16-bit accuracy for smooth transitions.
-- **Softness control:** Adjustable edge softness using smoothstep.
-- **Inversion:** Option to invert the mask behavior.
+- **Motion Blur Bias:** Control the temporal window of the transition.
+- **Inversion & Flipping:** Options to invert, flip horizontally, or flip vertically the mask.
 - **Native Performance:** Built as a C plugin for optimal integration with OBS Studio.
 
 ## Installation
@@ -55,10 +55,10 @@ This plugin uses CMake and follows the standard OBS plugin template structure.
     - Black (0%) = Transitions immediately.
     - White (100%) = Transitions at the very end.
     - 16-bit PNG images are recommended for the smoothest results.
-5.  Adjust **Softness** and **Invert Mask** as needed.
+5.  Adjust **Motion Blur Bias**, **Scaling Method**, **Invert Mask**, **Flip X**, and **Flip Y** as needed.
 
 ## Technical Details
 - **Plugin ID:** `luma_wipe_2026`
-- **Logic:** Pixel value `V` (0.0 to 1.0) means the switch occurs at `T = V`.
+- **Logic:** Pixel value `V` (0.0 to 1.0) in the mask determines when Source A switches to Source B.
+- **Motion Blur:** Uses a frame-delta estimated window to smoothly blend between sources.
 - **Shader:** Uses `luma_wipe.effect` (HLSL) for GPU-accelerated rendering.
-- **Transition Formula:** `lerp(SourceA, SourceB, smoothstep(V - softness, V, progress))`.

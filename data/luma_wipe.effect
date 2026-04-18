@@ -8,6 +8,7 @@ uniform float motion_blur_bias;
 uniform float blur_window;
 uniform bool flip_x;
 uniform bool flip_y;
+uniform float2 mask_uv_scale;
 
 sampler_state textureSampler {
     Filter   = Linear;
@@ -31,7 +32,8 @@ float4 PSLumaWipe(VertData v_in) : TARGET {
     float4 rgba_a = image.Sample(textureSampler, v_in.uv);
     float4 rgba_b = target.Sample(textureSampler, v_in.uv);
     
-    float2 mask_uv = v_in.uv;
+    float2 mask_uv = (v_in.uv - 0.5) * mask_uv_scale + 0.5;
+    
     if (flip_x) mask_uv.x = 1.0 - mask_uv.x;
     if (flip_y) mask_uv.y = 1.0 - mask_uv.y;
     
