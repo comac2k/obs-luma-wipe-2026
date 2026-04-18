@@ -1,4 +1,5 @@
-#include <graphics/image-file.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 #include <graphics/matrix4.h>
 #include <obs-module.h>
 #include <util/dstr.h>
@@ -19,12 +20,11 @@ struct luma_wipe_info {
 	gs_eparam_t *param_flip_x;
 	gs_eparam_t *param_flip_y;
 
-	gs_image_file_t mask_image;
+	gs_texture_t *mask_texture;
 	bool invert;
 	bool flip_x;
 	bool flip_y;
 	double motion_blur_bias;
-	uint32_t duration_ms;
 	float last_t;
 	char *mask_path;
 };
@@ -53,10 +53,20 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	filter->mask_path = (path && *path) ? bstrdup(path) : NULL;
 
 	obs_enter_graphics();
-	gs_image_file_free(&filter->mask_image);
+	if (filter->mask_texture) {
+		gs_texture_destroy(filter->mask_texture);
+		filter->mask_texture = NULL;
+	}
+
 	if (filter->mask_path) {
-		gs_image_file_init(&filter->mask_image, filter->mask_path);
-		gs_image_file_init_texture(&filter->mask_image);
+		int width, height, channels;
+		unsigned short *image_data = stbi_load_16(filter->mask_path, &width, &height, &channels, 1);
+		if (image_data) {
+			filter->mask_texture = gs_texture_create(width, height, GS_R16, 1, (const uint8_t **)&image_data, 0);
+			stbi_image_free(image_data);
+		} else {
+			blog(LOG_WARNING, "[Luma Wipe 2026] Failed to load mask: %s", filter->mask_path);
+		}
 	}
 	obs_leave_graphics();
 }
@@ -115,7 +125,9 @@ static void luma_wipe_destroy(void *data)
 	struct luma_wipe_info *filter = data;
 
 	obs_enter_graphics();
-	gs_image_file_free(&filter->mask_image);
+	if (filter->mask_texture) {
+		gs_texture_destroy(filter->mask_texture);
+	}
 	if (filter->effect) {
 		gs_effect_destroy(filter->effect);
 	}
@@ -129,7 +141,7 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 {
 	struct luma_wipe_info *filter = data;
 
-	if (!filter->effect || !filter->mask_image.texture) {
+	if (!filter->effect || !filter->mask_texture) {
 		// Fallback: simple crossfade if no mask or no effect
 		gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 		gs_eparam_t *param = gs_effect_get_param_by_name(default_effect, "image");
@@ -175,18 +187,12 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 
 	float t2 = t * (1.0f + 2.0f * blur_window) - blur_window;
 
-	if (obs_get_video_info(&ovi)) {
-		int est_duration = (int)(1000.0f * (float)ovi.fps_den / (dt * (float)ovi.fps_num));
-		blog(LOG_INFO, "t: %f, dt: %f, est_duration: %i, fps_num: %u, fps_den: %u", t, dt, est_duration,
-		     ovi.fps_num, ovi.fps_den);
-	}
-
 	struct matrix4 projection;
 	gs_matrix_get(&projection);
 
 	gs_effect_set_texture(filter->param_image, a);
 	gs_effect_set_texture(filter->param_target, b);
-	gs_effect_set_texture(filter->param_mask, filter->mask_image.texture);
+	gs_effect_set_texture(filter->param_mask, filter->mask_texture);
 	gs_effect_set_float(filter->param_progress, t2);
 	gs_effect_set_bool(filter->param_invert, filter->invert);
 	if (filter->param_bias) {
