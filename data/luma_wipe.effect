@@ -8,6 +8,7 @@ uniform float motion_blur_bias;
 uniform float blur_window;
 uniform bool flip_x;
 uniform bool flip_y;
+uniform bool rotate_90;
 uniform float2 mask_uv_scale;
 
 sampler_state textureSampler {
@@ -32,7 +33,14 @@ float4 PSLumaWipe(VertData v_in) : TARGET {
     float4 rgba_a = image.Sample(textureSampler, v_in.uv);
     float4 rgba_b = target.Sample(textureSampler, v_in.uv);
     
-    float2 mask_uv = (v_in.uv - 0.5) * mask_uv_scale + 0.5;
+    float2 mask_uv = v_in.uv;
+    
+    if (rotate_90) {
+        // 90 degrees clockwise rotation: (u, v) -> (v, 1-u)
+        mask_uv = float2(mask_uv.y, 1.0 - mask_uv.x);
+    }
+    
+    mask_uv = (mask_uv - 0.5) * mask_uv_scale + 0.5;
     
     if (flip_x) mask_uv.x = 1.0 - mask_uv.x;
     if (flip_y) mask_uv.y = 1.0 - mask_uv.y;
@@ -47,10 +55,6 @@ float4 PSLumaWipe(VertData v_in) : TARGET {
     float BW = blur_window;
     
     // Motion Blur Logic
-    // If mask_val > t2 + BW, show Source A (alpha = 0)
-    // If mask_val < t2, show Source B (alpha = 1)
-    // Else, mix both: alpha = (t2 + BW - mask_val) / BW
-    
     if (mask_val > t2 + BW)
         return rgba_a;
     if (mask_val < t2)
