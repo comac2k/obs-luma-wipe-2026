@@ -13,14 +13,16 @@ struct luma_wipe_info {
 	gs_eparam_t *param_mask;
 	gs_eparam_t *param_progress;
 	gs_eparam_t *param_invert;
-	gs_eparam_t *param_softness;
 	gs_eparam_t *param_bias;
 	gs_eparam_t *param_viewproj;
 	gs_eparam_t *param_blur_window;
+	gs_eparam_t *param_flip_x;
+	gs_eparam_t *param_flip_y;
 
 	gs_image_file_t mask_image;
 	bool invert;
-	double softness;
+	bool flip_x;
+	bool flip_y;
 	double motion_blur_bias;
 	uint32_t duration_ms;
 	float last_t;
@@ -39,9 +41,9 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	const char *path = obs_data_get_string(settings, "mask_path");
 
 	filter->invert = obs_data_get_bool(settings, "invert");
-	filter->softness = obs_data_get_double(settings, "softness");
+	filter->flip_x = obs_data_get_bool(settings, "flip_x");
+	filter->flip_y = obs_data_get_bool(settings, "flip_y");
 	filter->motion_blur_bias = obs_data_get_double(settings, "motion_blur_bias");
-	// filter->duration_ms = (uint32_t)obs_data_get_int(settings, "duration"); // Always 0
 
 	if (filter->mask_path && path && strcmp(filter->mask_path, path) == 0) {
 		return;
@@ -61,8 +63,10 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 
 static void luma_wipe_get_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_double(settings, "softness", 0.0);
 	obs_data_set_default_double(settings, "motion_blur_bias", 0.0);
+	obs_data_set_default_bool(settings, "invert", false);
+	obs_data_set_default_bool(settings, "flip_x", false);
+	obs_data_set_default_bool(settings, "flip_y", false);
 }
 
 static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
@@ -83,10 +87,11 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 			filter->param_mask = gs_effect_get_param_by_name(filter->effect, "luma_mask");
 			filter->param_progress = gs_effect_get_param_by_name(filter->effect, "progress");
 			filter->param_invert = gs_effect_get_param_by_name(filter->effect, "invert");
-			filter->param_softness = gs_effect_get_param_by_name(filter->effect, "softness");
 			filter->param_bias = gs_effect_get_param_by_name(filter->effect, "motion_blur_bias");
 			filter->param_viewproj = gs_effect_get_param_by_name(filter->effect, "ViewProj");
 			filter->param_blur_window = gs_effect_get_param_by_name(filter->effect, "blur_window");
+			filter->param_flip_x = gs_effect_get_param_by_name(filter->effect, "flip_x");
+			filter->param_flip_y = gs_effect_get_param_by_name(filter->effect, "flip_y");
 		} else {
 			blog(LOG_ERROR, "[Luma Wipe 2026] Effect file found but could not be loaded: %s", effect_path);
 			if (error_string) {
@@ -158,7 +163,16 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 		}
 	}
 
-	float blur_window = dt;
+	float bias = (float)filter->motion_blur_bias;
+	float blur_window_raw = dt;
+	float blur_window;
+
+	if (bias < 0.0f) {
+		blur_window = blur_window_raw * (bias + 1.0f);
+	} else {
+		blur_window = blur_window_raw * (1.0f - bias) + 1.0f * bias;
+	}
+
 	float t2 = t * (1.0f + 2.0f * blur_window) - blur_window;
 
 	if (obs_get_video_info(&ovi)) {
@@ -175,7 +189,6 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	gs_effect_set_texture(filter->param_mask, filter->mask_image.texture);
 	gs_effect_set_float(filter->param_progress, t2);
 	gs_effect_set_bool(filter->param_invert, filter->invert);
-	gs_effect_set_float(filter->param_softness, (float)filter->softness);
 	if (filter->param_bias) {
 		gs_effect_set_float(filter->param_bias, (float)filter->motion_blur_bias);
 	}
@@ -184,6 +197,12 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	}
 	if (filter->param_blur_window) {
 		gs_effect_set_float(filter->param_blur_window, blur_window);
+	}
+	if (filter->param_flip_x) {
+		gs_effect_set_bool(filter->param_flip_x, filter->flip_x);
+	}
+	if (filter->param_flip_y) {
+		gs_effect_set_bool(filter->param_flip_y, filter->flip_y);
 	}
 
 	while (gs_effect_loop(filter->effect, "LumaWipe")) {
@@ -229,7 +248,8 @@ static obs_properties_t *luma_wipe_get_properties(void *data)
 	bfree(lumas_path);
 
 	obs_properties_add_bool(props, "invert", obs_module_text("Invert"));
-	obs_properties_add_float_slider(props, "softness", obs_module_text("Softness"), 0.0, 1.0, 0.01);
+	obs_properties_add_bool(props, "flip_x", obs_module_text("FlipX"));
+	obs_properties_add_bool(props, "flip_y", obs_module_text("FlipY"));
 	obs_properties_add_float_slider(props, "motion_blur_bias", obs_module_text("MotionBlurBias"), -1.0, 1.0, 0.01);
 
 	return props;
