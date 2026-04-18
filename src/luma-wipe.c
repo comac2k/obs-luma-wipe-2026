@@ -16,11 +16,14 @@ struct luma_wipe_info {
 	gs_eparam_t *param_softness;
 	gs_eparam_t *param_bias;
 	gs_eparam_t *param_viewproj;
+	gs_eparam_t *param_blur_window;
 
 	gs_image_file_t mask_image;
 	bool invert;
 	double softness;
 	double motion_blur_bias;
+	uint32_t duration_ms;
+	float last_t;
 	char *mask_path;
 };
 
@@ -38,6 +41,7 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	filter->invert = obs_data_get_bool(settings, "invert");
 	filter->softness = obs_data_get_double(settings, "softness");
 	filter->motion_blur_bias = obs_data_get_double(settings, "motion_blur_bias");
+	// filter->duration_ms = (uint32_t)obs_data_get_int(settings, "duration"); // Always 0
 
 	if (filter->mask_path && path && strcmp(filter->mask_path, path) == 0) {
 		return;
@@ -82,6 +86,7 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 			filter->param_softness = gs_effect_get_param_by_name(filter->effect, "softness");
 			filter->param_bias = gs_effect_get_param_by_name(filter->effect, "motion_blur_bias");
 			filter->param_viewproj = gs_effect_get_param_by_name(filter->effect, "ViewProj");
+			filter->param_blur_window = gs_effect_get_param_by_name(filter->effect, "blur_window");
 		} else {
 			blog(LOG_ERROR, "[Luma Wipe 2026] Effect file found but could not be loaded: %s", effect_path);
 			if (error_string) {
@@ -132,13 +137,43 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 		return;
 	}
 
+	struct obs_video_info ovi;
+	float dt = 0.0f;
+
+	if (t > 0.0f && t < 1.0f) {
+		if (t < filter->last_t) {
+			dt = t;
+		} else {
+			dt = t - filter->last_t;
+		}
+	}
+	filter->last_t = t;
+
+	if (dt <= 0.0f) {
+		// Fallback for first frame or non-transitioning state
+		if (obs_get_video_info(&ovi)) {
+			dt = (float)ovi.fps_den / (float)ovi.fps_num;
+		} else {
+			dt = 0.0166f;
+		}
+	}
+
+	float blur_window = dt;
+	float t2 = t * (1.0f + 2.0f * blur_window) - blur_window;
+
+	if (obs_get_video_info(&ovi)) {
+		int est_duration = (int)(1000.0f * (float)ovi.fps_den / (dt * (float)ovi.fps_num));
+		blog(LOG_INFO, "t: %f, dt: %f, est_duration: %i, fps_num: %u, fps_den: %u", t, dt, est_duration,
+		     ovi.fps_num, ovi.fps_den);
+	}
+
 	struct matrix4 projection;
 	gs_matrix_get(&projection);
 
 	gs_effect_set_texture(filter->param_image, a);
 	gs_effect_set_texture(filter->param_target, b);
 	gs_effect_set_texture(filter->param_mask, filter->mask_image.texture);
-	gs_effect_set_float(filter->param_progress, t);
+	gs_effect_set_float(filter->param_progress, t2);
 	gs_effect_set_bool(filter->param_invert, filter->invert);
 	gs_effect_set_float(filter->param_softness, (float)filter->softness);
 	if (filter->param_bias) {
@@ -146,6 +181,9 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	}
 	if (filter->param_viewproj) {
 		gs_effect_set_matrix4(filter->param_viewproj, &projection);
+	}
+	if (filter->param_blur_window) {
+		gs_effect_set_float(filter->param_blur_window, blur_window);
 	}
 
 	while (gs_effect_loop(filter->effect, "LumaWipe")) {

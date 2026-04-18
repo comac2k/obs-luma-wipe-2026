@@ -2,10 +2,11 @@ uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform texture2d target;
 uniform texture2d luma_mask;
-uniform float progress;
+uniform float progress; // This is 't2' from C code
 uniform bool invert;
 uniform float softness;
 uniform float motion_blur_bias;
+uniform float blur_window;
 
 sampler_state textureSampler {
     Filter   = Linear;
@@ -29,22 +30,26 @@ float4 PSLumaWipe(VertData v_in) : TARGET {
     float4 rgba_a = image.Sample(textureSampler, v_in.uv);
     float4 rgba_b = target.Sample(textureSampler, v_in.uv);
     
-    float luma = luma_mask.Sample(textureSampler, v_in.uv).r;
+    float mask_val = luma_mask.Sample(textureSampler, v_in.uv).r;
     
     if (invert) {
-        luma = 1.0 - luma;
+        mask_val = 1.0 - mask_val;
     }
     
-    // Improved softness logic from OBS source
-    float time = lerp(0.0f, 1.0f + softness, progress);
-    float s = max(0.001, softness);
+    float t2 = progress;
+    float BW = blur_window;
     
-    if (luma <= time - s)
-        return rgba_b;
-    if (luma >= time)
+    // Motion Blur Logic
+    // If mask_val > t2 + BW, show Source A (alpha = 0)
+    // If mask_val < t2, show Source B (alpha = 1)
+    // Else, mix both: alpha = (t2 + BW - mask_val) / BW
+    
+    if (mask_val > t2 + BW)
         return rgba_a;
+    if (mask_val < t2)
+        return rgba_b;
         
-    float alpha = (time - luma) / s;
+    float alpha = (t2 + BW - mask_val) / BW;
     return lerp(rgba_a, rgba_b, alpha);
 }
 
