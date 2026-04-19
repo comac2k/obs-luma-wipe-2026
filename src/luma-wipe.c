@@ -1,6 +1,10 @@
+#define _USE_MATH_DEFINES
+#include <math.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <graphics/matrix4.h>
+#include <graphics/vec3.h>
+#include <graphics/quat.h>
 #include <obs-module.h>
 #include <util/dstr.h>
 #include <util/platform.h>
@@ -22,10 +26,7 @@ struct luma_wipe_info {
 	gs_eparam_t *param_bias;
 	gs_eparam_t *param_viewproj;
 	gs_eparam_t *param_blur_window;
-	gs_eparam_t *param_flip_x;
-	gs_eparam_t *param_flip_y;
-	gs_eparam_t *param_rotate_90;
-	gs_eparam_t *param_mask_uv_scale;
+	gs_eparam_t *param_mask_transform;
 
 	gs_texture_t *mask_texture;
 	uint32_t mask_width;
@@ -34,7 +35,7 @@ struct luma_wipe_info {
 	bool invert;
 	bool flip_x;
 	bool flip_y;
-	bool rotate_90;
+	double rotation;
 	enum scaling_method scaling;
 	double motion_blur_bias;
 	float last_t;
@@ -55,7 +56,7 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	filter->invert = obs_data_get_bool(settings, "invert");
 	filter->flip_x = obs_data_get_bool(settings, "flip_x");
 	filter->flip_y = obs_data_get_bool(settings, "flip_y");
-	filter->rotate_90 = obs_data_get_bool(settings, "rotate_90");
+	filter->rotation = obs_data_get_double(settings, "rotation");
 	filter->motion_blur_bias = obs_data_get_double(settings, "motion_blur_bias");
 	filter->scaling = (enum scaling_method)obs_data_get_int(settings, "scaling_method");
 
@@ -95,37 +96,8 @@ static void luma_wipe_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "invert", false);
 	obs_data_set_default_bool(settings, "flip_x", false);
 	obs_data_set_default_bool(settings, "flip_y", false);
-	obs_data_set_default_bool(settings, "rotate_90", false);
+	obs_data_set_default_double(settings, "rotation", 0.0);
 	obs_data_set_default_int(settings, "scaling_method", SCALING_CROP);
-}
-
-static bool mask_path_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	const char *path = obs_data_get_string(settings, "mask_path");
-	if (!path || !*path) {
-		return false;
-	}
-
-	int width, height, channels;
-	if (stbi_info(path, &width, &height, &channels)) {
-		struct obs_video_info ovi;
-		float source_aspect = 16.0f / 9.0f;
-		if (obs_get_video_info(&ovi)) {
-			source_aspect = (float)ovi.base_width / (float)ovi.base_height;
-		}
-
-		float mask_aspect = (float)width / (float)height;
-		float rotated_aspect = (float)height / (float)width;
-
-		float diff_normal = fabsf(source_aspect - mask_aspect);
-		float diff_rotated = fabsf(source_aspect - rotated_aspect);
-
-		obs_data_set_bool(settings, "rotate_90", diff_rotated < diff_normal);
-	}
-
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	return true;
 }
 
 static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
@@ -149,10 +121,7 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 			filter->param_bias = gs_effect_get_param_by_name(filter->effect, "motion_blur_bias");
 			filter->param_viewproj = gs_effect_get_param_by_name(filter->effect, "ViewProj");
 			filter->param_blur_window = gs_effect_get_param_by_name(filter->effect, "blur_window");
-			filter->param_flip_x = gs_effect_get_param_by_name(filter->effect, "flip_x");
-			filter->param_flip_y = gs_effect_get_param_by_name(filter->effect, "flip_y");
-			filter->param_rotate_90 = gs_effect_get_param_by_name(filter->effect, "rotate_90");
-			filter->param_mask_uv_scale = gs_effect_get_param_by_name(filter->effect, "mask_uv_scale");
+			filter->param_mask_transform = gs_effect_get_param_by_name(filter->effect, "mask_transform");
 		} else {
 			blog(LOG_ERROR, "[Luma Wipe 2026] Effect file found but could not be loaded: %s", effect_path);
 			if (error_string) {
@@ -192,8 +161,8 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 {
 	struct luma_wipe_info *filter = data;
 
-	if (!filter->effect || !filter->mask_texture) {
-		// Fallback: simple crossfade if no mask or no effect
+	if (!filter->effect || !filter->mask_texture || filter->mask_width == 0 || filter->mask_height == 0) {
+		// Fallback: simple crossfade if no mask, no effect or zero dimensions
 		gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 		gs_eparam_t *param = gs_effect_get_param_by_name(default_effect, "image");
 
@@ -241,28 +210,36 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	struct matrix4 projection;
 	gs_matrix_get(&projection);
 
-	float mask_uv_scale[2] = {1.0f, 1.0f};
-	if (filter->scaling == SCALING_CROP && filter->mask_width > 0 && filter->mask_height > 0) {
-		float source_aspect = (float)cx / (float)cy;
-		float mask_w = (float)filter->mask_width;
-		float mask_h = (float)filter->mask_height;
+	struct matrix4 m;
+	matrix4_identity(&m);
+	matrix4_translate3f(&m, &m, -0.5f, -0.5f, 0.0f);
+	matrix4_scale3f(&m, &m, filter->flip_x ? -1.0f : 1.0f, filter->flip_y ? -1.0f : 1.0f, 1.0f);
+	matrix4_scale3f(&m, &m, (float)cx, (float)cy, 1.0f);
 
-		if (filter->rotate_90) {
-			float tmp = mask_w;
-			mask_w = mask_h;
-			mask_h = tmp;
-		}
+	float theta = (float)(filter->rotation * M_PI / 180.0);
+	matrix4_rotate_aa4f(&m, &m, 0.0f, 0.0f, 1.0f, -theta);
 
-		float mask_aspect = mask_w / mask_h;
+	float source_w = (float)cx;
+	float source_h = (float)cy;
+	float cos_theta = cosf(theta);
+	float sin_theta = sinf(theta);
 
-		if (source_aspect > mask_aspect) {
-			mask_uv_scale[0] = 1.0f;
-			mask_uv_scale[1] = mask_aspect / source_aspect;
+	float bw = fabsf(source_w * cos_theta) + fabsf(source_h * sin_theta);
+	float bh = fabsf(source_w * sin_theta) + fabsf(source_h * cos_theta);
+
+	if (filter->scaling == SCALING_CROP) {
+		float rotated_source_ar = bw / bh;
+		float mask_ar = (float)filter->mask_width / (float)filter->mask_height;
+
+		if (rotated_source_ar > mask_ar) {
+			matrix4_scale3f(&m, &m, 1.0f, mask_ar / rotated_source_ar, 1.0f);
 		} else {
-			mask_uv_scale[0] = source_aspect / mask_aspect;
-			mask_uv_scale[1] = 1.0f;
+			matrix4_scale3f(&m, &m, rotated_source_ar / mask_ar, 1.0f, 1.0f);
 		}
 	}
+
+	matrix4_scale3f(&m, &m, 1.0f / bw, 1.0f / bh, 1.0f);
+	matrix4_translate3f(&m, &m, 0.5f, 0.5f, 0.0f);
 
 	gs_effect_set_texture(filter->param_image, a);
 	gs_effect_set_texture(filter->param_target, b);
@@ -278,17 +255,8 @@ static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, flo
 	if (filter->param_blur_window) {
 		gs_effect_set_float(filter->param_blur_window, blur_window);
 	}
-	if (filter->param_flip_x) {
-		gs_effect_set_bool(filter->param_flip_x, filter->flip_x);
-	}
-	if (filter->param_flip_y) {
-		gs_effect_set_bool(filter->param_flip_y, filter->flip_y);
-	}
-	if (filter->param_rotate_90) {
-		gs_effect_set_bool(filter->param_rotate_90, filter->rotate_90);
-	}
-	if (filter->param_mask_uv_scale) {
-		gs_effect_set_vec2(filter->param_mask_uv_scale, (const struct vec2 *)mask_uv_scale);
+	if (filter->param_mask_transform) {
+		gs_effect_set_matrix4(filter->param_mask_transform, &m);
 	}
 
 	while (gs_effect_loop(filter->effect, "LumaWipe")) {
@@ -329,15 +297,14 @@ static obs_properties_t *luma_wipe_get_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 
 	char *lumas_path = obs_module_file("lumas");
-	obs_property_t *p_path = obs_properties_add_path(props, "mask_path", obs_module_text("MaskPath"), OBS_PATH_FILE,
+	obs_properties_add_path(props, "mask_path", obs_module_text("MaskPath"), OBS_PATH_FILE,
 							 obs_module_text("FilterFiles"), lumas_path);
-	obs_property_set_modified_callback(p_path, mask_path_modified);
 	bfree(lumas_path);
 
 	obs_properties_add_bool(props, "invert", obs_module_text("Invert"));
 	obs_properties_add_bool(props, "flip_x", obs_module_text("FlipX"));
 	obs_properties_add_bool(props, "flip_y", obs_module_text("FlipY"));
-	obs_properties_add_bool(props, "rotate_90", obs_module_text("Rotate90"));
+	obs_properties_add_float_slider(props, "rotation", obs_module_text("Rotation"), -180.0, 180.0, 0.1);
 
 	obs_property_t *p_scale = obs_properties_add_list(props, "scaling_method", obs_module_text("ScalingMethod"),
 							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);

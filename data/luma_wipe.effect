@@ -6,10 +6,7 @@ uniform float progress; // This is 't2' from C code
 uniform bool invert;
 uniform float motion_blur_bias;
 uniform float blur_window;
-uniform bool flip_x;
-uniform bool flip_y;
-uniform bool rotate_90;
-uniform float2 mask_uv_scale;
+uniform float4x4 mask_transform;
 
 sampler_state textureSampler {
     Filter   = Linear;
@@ -33,17 +30,7 @@ float4 PSLumaWipe(VertData v_in) : TARGET {
     float4 rgba_a = image.Sample(textureSampler, v_in.uv);
     float4 rgba_b = target.Sample(textureSampler, v_in.uv);
     
-    float2 mask_uv = v_in.uv;
-    
-    if (rotate_90) {
-        // 90 degrees clockwise rotation: (u, v) -> (v, 1-u)
-        mask_uv = float2(mask_uv.y, 1.0 - mask_uv.x);
-    }
-    
-    mask_uv = (mask_uv - 0.5) * mask_uv_scale + 0.5;
-    
-    if (flip_x) mask_uv.x = 1.0 - mask_uv.x;
-    if (flip_y) mask_uv.y = 1.0 - mask_uv.y;
+    float2 mask_uv = mul(mask_transform, float4(v_in.uv, 0.0, 1.0)).xy;
     
     float mask_val = luma_mask.Sample(textureSampler, mask_uv).r;
     
