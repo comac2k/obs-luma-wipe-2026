@@ -3,16 +3,13 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <graphics/matrix4.h>
-#include <graphics/vec3.h>
 #include <graphics/quat.h>
+#include <graphics/vec3.h>
 #include <obs-module.h>
 #include <util/dstr.h>
 #include <util/platform.h>
 
-enum scaling_method {
-	SCALING_STRETCH,
-	SCALING_CROP
-};
+enum scaling_method { SCALING_STRETCH, SCALING_CROP };
 
 struct luma_wipe_info {
 	obs_source_t *source;
@@ -79,7 +76,8 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 		int width, height, channels;
 		unsigned short *image_data = stbi_load_16(filter->mask_path, &width, &height, &channels, 1);
 		if (image_data) {
-			filter->mask_texture = gs_texture_create(width, height, GS_R16, 1, (const uint8_t **)&image_data, 0);
+			filter->mask_texture =
+				gs_texture_create(width, height, GS_R16, 1, (const uint8_t **)&image_data, 0);
 			filter->mask_width = (uint32_t)width;
 			filter->mask_height = (uint32_t)height;
 			stbi_image_free(image_data);
@@ -298,7 +296,7 @@ static obs_properties_t *luma_wipe_get_properties(void *data)
 
 	char *lumas_path = obs_module_file("lumas");
 	obs_properties_add_path(props, "mask_path", obs_module_text("MaskPath"), OBS_PATH_FILE,
-							 obs_module_text("FilterFiles"), lumas_path);
+				obs_module_text("FilterFiles"), lumas_path);
 	bfree(lumas_path);
 
 	obs_properties_add_bool(props, "invert", obs_module_text("Invert"));
