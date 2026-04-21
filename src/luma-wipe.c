@@ -1,0 +1,489 @@
+#define _USE_MATH_DEFINES
+#include <math.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include <graphics/matrix4.h>
+#include <graphics/quat.h>
+#include <graphics/vec3.h>
+#include <obs-module.h>
+#include <util/dstr.h>
+#include <util/platform.h>
+#include <util/task.h>
+#include <util/threading.h>
+
+enum scaling_method { SCALING_STRETCH, SCALING_CROP };
+
+struct luma_wipe_info {
+	obs_source_t *source;
+	gs_effect_t *effect;
+
+	gs_eparam_t *param_image;
+	gs_eparam_t *param_target;
+	gs_eparam_t *param_mask;
+	gs_eparam_t *param_progress;
+	gs_eparam_t *param_invert;
+	gs_eparam_t *param_bias;
+	gs_eparam_t *param_viewproj;
+	gs_eparam_t *param_blur_window;
+	gs_eparam_t *param_mask_transform;
+
+	gs_texture_t *mask_texture;
+	uint32_t mask_width;
+	uint32_t mask_height;
+
+	bool invert;
+	bool flip_x;
+	bool flip_y;
+	double rotation;
+	enum scaling_method scaling;
+	double motion_blur_bias;
+	float last_t;
+	char *mask_path;
+
+	os_task_queue_t *load_queue;
+	volatile bool is_loading;
+	volatile bool has_new_data;
+	unsigned short *pending_mask_data;
+	uint32_t pending_width;
+	uint32_t pending_height;
+
+	pthread_mutex_t data_mutex;
+	unsigned short *working_mask_data;
+	gs_texture_t *staging_texture;
+	uint32_t upload_y;
+	bool is_progressive_uploading;
+};
+
+struct load_data {
+	obs_weak_source_t *weak_source;
+	char *path;
+};
+
+static void luma_wipe_load_task(void *param)
+{
+	struct load_data *data = param;
+	obs_source_t *source = obs_weak_source_get_source(data->weak_source);
+
+	if (source) {
+		struct luma_wipe_info *filter = obs_obj_get_data(source);
+
+		int width, height, channels;
+		unsigned short *image_data = stbi_load_16(data->path, &width, &height, &channels, 1);
+
+		if (image_data) {
+			pthread_mutex_lock(&filter->data_mutex);
+			// Clean up any old pending data before setting new
+			stbi_image_free(filter->pending_mask_data);
+
+			filter->pending_mask_data = image_data;
+			filter->pending_width = (uint32_t)width;
+			filter->pending_height = (uint32_t)height;
+			os_atomic_set_bool(&filter->has_new_data, true);
+			pthread_mutex_unlock(&filter->data_mutex);
+		} else {
+			blog(LOG_WARNING, "[Luma Wipe 2026] Failed to load mask: %s", data->path);
+			os_atomic_set_bool(&filter->is_loading, false);
+		}
+		obs_source_release(source);
+	}
+
+	obs_weak_source_release(data->weak_source);
+	bfree(data->path);
+	bfree(data);
+}
+
+static const char *luma_wipe_get_name(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("LumaWipe");
+}
+
+static void luma_wipe_update(void *data, obs_data_t *settings)
+{
+	struct luma_wipe_info *filter = data;
+	const char *path = obs_data_get_string(settings, "mask_path");
+
+	filter->invert = obs_data_get_bool(settings, "invert");
+	filter->flip_x = obs_data_get_bool(settings, "flip_x");
+	filter->flip_y = obs_data_get_bool(settings, "flip_y");
+	filter->rotation = obs_data_get_double(settings, "rotation");
+	filter->motion_blur_bias = obs_data_get_double(settings, "motion_blur_bias");
+	filter->scaling = (enum scaling_method)obs_data_get_int(settings, "scaling_method");
+
+	if (filter->mask_path && path && strcmp(filter->mask_path, path) == 0) {
+		return;
+	}
+
+	bfree(filter->mask_path);
+	filter->mask_path = (path && *path) ? bstrdup(path) : NULL;
+
+	if (filter->mask_path) {
+		struct load_data *ld = bzalloc(sizeof(*ld));
+		ld->weak_source = obs_source_get_weak_source(filter->source);
+		ld->path = bstrdup(filter->mask_path);
+
+		os_atomic_set_bool(&filter->is_loading, true);
+		os_task_queue_queue_task(filter->load_queue, luma_wipe_load_task, ld);
+	} else {
+		obs_enter_graphics();
+		if (filter->mask_texture) {
+			gs_texture_destroy(filter->mask_texture);
+			filter->mask_texture = NULL;
+			filter->mask_width = 0;
+			filter->mask_height = 0;
+		}
+		obs_leave_graphics();
+	}
+}
+
+static void luma_wipe_get_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_double(settings, "motion_blur_bias", 0.0);
+	obs_data_set_default_bool(settings, "invert", false);
+	obs_data_set_default_bool(settings, "flip_x", false);
+	obs_data_set_default_bool(settings, "flip_y", false);
+	obs_data_set_default_double(settings, "rotation", 0.0);
+	obs_data_set_default_int(settings, "scaling_method", SCALING_CROP);
+}
+
+static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
+{
+	struct luma_wipe_info *filter = bzalloc(sizeof(struct luma_wipe_info));
+	filter->source = source;
+	filter->load_queue = os_task_queue_create();
+	pthread_mutex_init(&filter->data_mutex, NULL);
+
+	char *effect_path = obs_module_file("luma_wipe.effect");
+	if (effect_path) {
+		char *error_string = NULL;
+		obs_enter_graphics();
+		filter->effect = gs_effect_create_from_file(effect_path, &error_string);
+		obs_leave_graphics();
+
+		if (filter->effect) {
+			filter->param_image = gs_effect_get_param_by_name(filter->effect, "image");
+			filter->param_target = gs_effect_get_param_by_name(filter->effect, "target");
+			filter->param_mask = gs_effect_get_param_by_name(filter->effect, "luma_mask");
+			filter->param_progress = gs_effect_get_param_by_name(filter->effect, "progress");
+			filter->param_invert = gs_effect_get_param_by_name(filter->effect, "invert");
+			filter->param_bias = gs_effect_get_param_by_name(filter->effect, "motion_blur_bias");
+			filter->param_viewproj = gs_effect_get_param_by_name(filter->effect, "ViewProj");
+			filter->param_blur_window = gs_effect_get_param_by_name(filter->effect, "blur_window");
+			filter->param_mask_transform = gs_effect_get_param_by_name(filter->effect, "mask_transform");
+		} else {
+			blog(LOG_ERROR, "[Luma Wipe 2026] Effect file found but could not be loaded: %s", effect_path);
+			if (error_string) {
+				blog(LOG_ERROR, "[Luma Wipe 2026] Shader errors:\n%s", error_string);
+				bfree(error_string);
+			}
+		}
+		bfree(effect_path);
+	} else {
+		blog(LOG_ERROR, "[Luma Wipe 2026] Could not find luma_wipe.effect. Please ensure it is in the plugin's "
+				"data directory (usually data/obs-plugins/luma-wipe-2026/).");
+	}
+
+	luma_wipe_update(filter, settings);
+
+	return filter;
+}
+
+static void luma_wipe_destroy(void *data)
+{
+	struct luma_wipe_info *filter = data;
+
+	os_task_queue_destroy(filter->load_queue);
+
+	obs_enter_graphics();
+	if (filter->mask_texture) {
+		gs_texture_destroy(filter->mask_texture);
+	}
+	if (filter->staging_texture) {
+		gs_texture_destroy(filter->staging_texture);
+	}
+	if (filter->effect) {
+		gs_effect_destroy(filter->effect);
+	}
+	obs_leave_graphics();
+
+	pthread_mutex_destroy(&filter->data_mutex);
+	stbi_image_free(filter->pending_mask_data);
+	stbi_image_free(filter->working_mask_data);
+	bfree(filter->mask_path);
+	bfree(filter);
+}
+
+static void luma_wipe_video_tick(void *data, float seconds)
+{
+	struct luma_wipe_info *filter = data;
+	UNUSED_PARAMETER(seconds);
+
+	if (os_atomic_load_bool(&filter->has_new_data)) {
+		pthread_mutex_lock(&filter->data_mutex);
+		obs_enter_graphics();
+
+		if (filter->working_mask_data) {
+			stbi_image_free(filter->working_mask_data);
+		}
+
+		filter->working_mask_data = filter->pending_mask_data;
+		filter->pending_mask_data = NULL;
+
+		if (filter->mask_texture)
+			gs_texture_destroy(filter->mask_texture);
+
+		// Create the large texture empty
+		filter->mask_texture =
+			gs_texture_create(filter->pending_width, filter->pending_height, GS_R16, 1, NULL, 0);
+		filter->mask_width = filter->pending_width;
+		filter->mask_height = filter->pending_height;
+
+		filter->upload_y = 0;
+		filter->is_progressive_uploading = true;
+		os_atomic_set_bool(&filter->has_new_data, false);
+
+		obs_leave_graphics();
+		pthread_mutex_unlock(&filter->data_mutex);
+	}
+
+	if (filter->is_progressive_uploading) {
+		const uint32_t chunk_size = 256;
+
+		pthread_mutex_lock(&filter->data_mutex);
+
+		if (filter->working_mask_data) {
+			uint32_t rows_left = filter->mask_height - filter->upload_y;
+			uint32_t rows_to_copy = (rows_left < chunk_size) ? rows_left : chunk_size;
+
+			obs_enter_graphics();
+
+			// Recreate staging texture if needed
+			if (!filter->staging_texture ||
+			    gs_texture_get_width(filter->staging_texture) != filter->mask_width ||
+			    gs_texture_get_height(filter->staging_texture) != chunk_size) {
+				if (filter->staging_texture)
+					gs_texture_destroy(filter->staging_texture);
+				filter->staging_texture =
+					gs_texture_create(filter->mask_width, chunk_size, GS_R16, 1, NULL, GS_DYNAMIC);
+			}
+
+			if (filter->staging_texture && filter->mask_texture) {
+				uint8_t *ptr;
+				uint32_t linesize_out;
+				if (gs_texture_map(filter->staging_texture, &ptr, &linesize_out)) {
+					const uint8_t *src_data =
+						(const uint8_t *)(filter->working_mask_data +
+								  filter->upload_y * filter->mask_width);
+					uint32_t linesize_in = filter->mask_width * 2;
+					for (uint32_t y = 0; y < rows_to_copy; y++) {
+						memcpy(ptr + y * linesize_out, src_data + y * linesize_in, linesize_in);
+					}
+					gs_texture_unmap(filter->staging_texture);
+
+					gs_copy_texture_region(filter->mask_texture, 0, filter->upload_y,
+							       filter->staging_texture, 0, 0, filter->mask_width,
+							       rows_to_copy);
+				}
+			}
+
+			filter->upload_y += rows_to_copy;
+
+			if (filter->upload_y >= filter->mask_height) {
+				filter->is_progressive_uploading = false;
+				stbi_image_free(filter->working_mask_data);
+				filter->working_mask_data = NULL;
+				os_atomic_set_bool(&filter->is_loading, false);
+			}
+
+			obs_leave_graphics();
+		} else {
+			// Should not happen if is_progressive_uploading is true
+			filter->is_progressive_uploading = false;
+		}
+
+		pthread_mutex_unlock(&filter->data_mutex);
+	}
+}
+
+static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, float t, uint32_t cx, uint32_t cy)
+{
+	struct luma_wipe_info *filter = data;
+
+	if (!filter->effect || !filter->mask_texture || filter->mask_width == 0 || filter->mask_height == 0) {
+		// Fallback: simple crossfade if no mask, no effect or zero dimensions
+		gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+		gs_eparam_t *param = gs_effect_get_param_by_name(default_effect, "image");
+
+		gs_effect_set_texture(param, (t < 0.5f) ? a : b);
+
+		while (gs_effect_loop(default_effect, "Draw")) {
+			gs_draw_sprite(NULL, 0, cx, cy);
+		}
+		return;
+	}
+
+	struct obs_video_info ovi;
+	float dt = 0.0f;
+
+	if (t > 0.0f && t < 1.0f) {
+		if (t < filter->last_t) {
+			dt = t;
+		} else {
+			dt = t - filter->last_t;
+		}
+	}
+	filter->last_t = t;
+
+	if (dt <= 0.0f) {
+		// Fallback for first frame or non-transitioning state
+		if (obs_get_video_info(&ovi)) {
+			dt = (float)ovi.fps_den / (float)ovi.fps_num;
+		} else {
+			dt = 0.0166f;
+		}
+	}
+
+	float bias = (float)filter->motion_blur_bias;
+	float blur_window_raw = dt;
+	float blur_window;
+
+	if (bias < 0.0f) {
+		blur_window = blur_window_raw * (bias + 1.0f);
+	} else {
+		blur_window = blur_window_raw * (1.0f - bias) + 1.0f * bias;
+	}
+
+	float t2 = t * (1.0f + 2.0f * blur_window) - blur_window;
+
+	struct matrix4 projection;
+	gs_matrix_get(&projection);
+
+	struct matrix4 m;
+	matrix4_identity(&m);
+	matrix4_translate3f(&m, &m, -0.5f, -0.5f, 0.0f);
+	matrix4_scale3f(&m, &m, filter->flip_x ? -1.0f : 1.0f, filter->flip_y ? -1.0f : 1.0f, 1.0f);
+	matrix4_scale3f(&m, &m, (float)cx, (float)cy, 1.0f);
+
+	float theta = (float)(filter->rotation * M_PI / 180.0);
+	matrix4_rotate_aa4f(&m, &m, 0.0f, 0.0f, 1.0f, -theta);
+
+	float source_w = (float)cx;
+	float source_h = (float)cy;
+	float cos_theta = cosf(theta);
+	float sin_theta = sinf(theta);
+
+	float bw = fabsf(source_w * cos_theta) + fabsf(source_h * sin_theta);
+	float bh = fabsf(source_w * sin_theta) + fabsf(source_h * cos_theta);
+
+	if (filter->scaling == SCALING_CROP) {
+		float rotated_source_ar = bw / bh;
+		float mask_ar = (float)filter->mask_width / (float)filter->mask_height;
+
+		if (rotated_source_ar > mask_ar) {
+			matrix4_scale3f(&m, &m, 1.0f, mask_ar / rotated_source_ar, 1.0f);
+		} else {
+			matrix4_scale3f(&m, &m, rotated_source_ar / mask_ar, 1.0f, 1.0f);
+		}
+	}
+
+	matrix4_scale3f(&m, &m, 1.0f / bw, 1.0f / bh, 1.0f);
+	matrix4_translate3f(&m, &m, 0.5f, 0.5f, 0.0f);
+
+	gs_effect_set_texture(filter->param_image, a);
+	gs_effect_set_texture(filter->param_target, b);
+	gs_effect_set_texture(filter->param_mask, filter->mask_texture);
+	gs_effect_set_float(filter->param_progress, t2);
+	gs_effect_set_bool(filter->param_invert, filter->invert);
+	if (filter->param_bias) {
+		gs_effect_set_float(filter->param_bias, (float)filter->motion_blur_bias);
+	}
+	if (filter->param_viewproj) {
+		gs_effect_set_matrix4(filter->param_viewproj, &projection);
+	}
+	if (filter->param_blur_window) {
+		gs_effect_set_float(filter->param_blur_window, blur_window);
+	}
+	if (filter->param_mask_transform) {
+		gs_effect_set_matrix4(filter->param_mask_transform, &m);
+	}
+
+	while (gs_effect_loop(filter->effect, "LumaWipe")) {
+		gs_draw_sprite(NULL, 0, cx, cy);
+	}
+}
+
+static void luma_wipe_video_render(void *data, gs_effect_t *effect)
+{
+	struct luma_wipe_info *filter = data;
+	UNUSED_PARAMETER(effect);
+
+	obs_transition_video_render(filter->source, luma_wipe_callback);
+}
+
+static float mix_a(void *data, float t)
+{
+	UNUSED_PARAMETER(data);
+	return 1.0f - t;
+}
+
+static float mix_b(void *data, float t)
+{
+	UNUSED_PARAMETER(data);
+	return t;
+}
+
+static bool luma_wipe_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio, uint32_t mixers,
+				   size_t channels, size_t sample_rate)
+{
+	struct luma_wipe_info *filter = data;
+	return obs_transition_audio_render(filter->source, ts_out, audio, mixers, channels, sample_rate, mix_a, mix_b);
+}
+
+static obs_properties_t *luma_wipe_get_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+	obs_properties_t *props = obs_properties_create();
+
+	char *lumas_path = obs_module_file("lumas");
+	obs_properties_add_path(props, "mask_path", obs_module_text("MaskPath"), OBS_PATH_FILE,
+				obs_module_text("FilterFiles"), lumas_path);
+	bfree(lumas_path);
+
+	obs_properties_add_bool(props, "invert", obs_module_text("Invert"));
+	obs_properties_add_bool(props, "flip_x", obs_module_text("FlipX"));
+	obs_properties_add_bool(props, "flip_y", obs_module_text("FlipY"));
+	obs_properties_add_float_slider(props, "rotation", obs_module_text("Rotation"), -180.0, 180.0, 0.1);
+
+	obs_property_t *p_scale = obs_properties_add_list(props, "scaling_method", obs_module_text("ScalingMethod"),
+							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p_scale, obs_module_text("Scaling.Stretch"), SCALING_STRETCH);
+	obs_property_list_add_int(p_scale, obs_module_text("Scaling.Crop"), SCALING_CROP);
+
+	obs_properties_add_float_slider(props, "motion_blur_bias", obs_module_text("MotionBlurBias"), -1.0, 1.0, 0.01);
+
+	return props;
+}
+
+struct obs_source_info luma_wipe_info = {
+	.id = "luma_wipe_2026",
+	.type = OBS_SOURCE_TYPE_TRANSITION,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_COMPOSITE,
+	.get_name = luma_wipe_get_name,
+	.create = luma_wipe_create,
+	.destroy = luma_wipe_destroy,
+	.update = luma_wipe_update,
+	.get_defaults = luma_wipe_get_defaults,
+	.video_tick = luma_wipe_video_tick,
+	.video_render = luma_wipe_video_render,
+	.audio_render = luma_wipe_audio_render,
+	.get_properties = luma_wipe_get_properties,
+};
+
+OBS_DECLARE_MODULE()
+OBS_MODULE_USE_DEFAULT_LOCALE("luma-wipe-2026", "en-US")
+
+bool obs_module_load(void)
+{
+	obs_register_source(&luma_wipe_info);
+	return true;
+}

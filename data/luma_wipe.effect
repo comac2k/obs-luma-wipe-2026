@@ -1,0 +1,59 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d target;
+uniform texture2d luma_mask;
+uniform float progress; // This is 't2' from C code
+uniform bool invert;
+uniform float motion_blur_bias;
+uniform float blur_window;
+uniform float4x4 mask_transform;
+
+sampler_state textureSampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in) {
+    VertData v_out;
+    v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    v_out.uv  = v_in.uv;
+    return v_out;
+}
+
+float4 PSLumaWipe(VertData v_in) : TARGET {
+    float4 rgba_a = image.Sample(textureSampler, v_in.uv);
+    float4 rgba_b = target.Sample(textureSampler, v_in.uv);
+    
+    float2 mask_uv = mul(mask_transform, float4(v_in.uv, 0.0, 1.0)).xy;
+    
+    float mask_val = luma_mask.Sample(textureSampler, mask_uv).r;
+    
+    if (invert) {
+        mask_val = 1.0 - mask_val;
+    }
+    
+    float t2 = progress;
+    float BW = blur_window;
+    
+    // Motion Blur Logic
+    if (mask_val > t2 + BW)
+        return rgba_a;
+    if (mask_val < t2)
+        return rgba_b;
+        
+    float alpha = (t2 + BW - mask_val) / BW;
+    return lerp(rgba_a, rgba_b, alpha);
+}
+
+technique LumaWipe {
+    pass P0 {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSLumaWipe(v_in);
+    }
+}

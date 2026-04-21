@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "com.geminicli.luma-wipe-2026"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
-    "email": "me@example.com"
+    "name": "luma-wipe-2026",
+    "displayName": "Luma Wipe 2026",
+    "version": "0.0.1",
+    "author": "ComaC (https://github.com/comac2k)",
+    "website": "https://github.com/comac2k/obs-luma-wipe-2026",
+    "email": "comac2k@gmail.com"
 }
