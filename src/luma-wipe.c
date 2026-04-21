@@ -8,6 +8,8 @@
 #include <obs-module.h>
 #include <util/dstr.h>
 #include <util/platform.h>
+#include <util/task.h>
+#include <util/threading.h>
 
 enum scaling_method { SCALING_STRETCH, SCALING_CROP };
 
@@ -37,7 +39,58 @@ struct luma_wipe_info {
 	double motion_blur_bias;
 	float last_t;
 	char *mask_path;
+
+	os_task_queue_t *load_queue;
+	volatile bool is_loading;
+	volatile bool has_new_data;
+	unsigned short *pending_mask_data;
+	uint32_t pending_width;
+	uint32_t pending_height;
+
+	pthread_mutex_t data_mutex;
+	unsigned short *working_mask_data;
+	gs_texture_t *staging_texture;
+	uint32_t upload_y;
+	bool is_progressive_uploading;
 };
+
+struct load_data {
+	obs_weak_source_t *weak_source;
+	char *path;
+};
+
+static void luma_wipe_load_task(void *param)
+{
+	struct load_data *data = param;
+	obs_source_t *source = obs_weak_source_get_source(data->weak_source);
+
+	if (source) {
+		struct luma_wipe_info *filter = obs_obj_get_data(source);
+
+		int width, height, channels;
+		unsigned short *image_data = stbi_load_16(data->path, &width, &height, &channels, 1);
+
+		if (image_data) {
+			pthread_mutex_lock(&filter->data_mutex);
+			// Clean up any old pending data before setting new
+			stbi_image_free(filter->pending_mask_data);
+
+			filter->pending_mask_data = image_data;
+			filter->pending_width = (uint32_t)width;
+			filter->pending_height = (uint32_t)height;
+			os_atomic_set_bool(&filter->has_new_data, true);
+			pthread_mutex_unlock(&filter->data_mutex);
+		} else {
+			blog(LOG_WARNING, "[Luma Wipe 2026] Failed to load mask: %s", data->path);
+			os_atomic_set_bool(&filter->is_loading, false);
+		}
+		obs_source_release(source);
+	}
+
+	obs_weak_source_release(data->weak_source);
+	bfree(data->path);
+	bfree(data);
+}
 
 static const char *luma_wipe_get_name(void *unused)
 {
@@ -64,28 +117,23 @@ static void luma_wipe_update(void *data, obs_data_t *settings)
 	bfree(filter->mask_path);
 	filter->mask_path = (path && *path) ? bstrdup(path) : NULL;
 
-	obs_enter_graphics();
-	if (filter->mask_texture) {
-		gs_texture_destroy(filter->mask_texture);
-		filter->mask_texture = NULL;
-		filter->mask_width = 0;
-		filter->mask_height = 0;
-	}
-
 	if (filter->mask_path) {
-		int width, height, channels;
-		unsigned short *image_data = stbi_load_16(filter->mask_path, &width, &height, &channels, 1);
-		if (image_data) {
-			filter->mask_texture =
-				gs_texture_create(width, height, GS_R16, 1, (const uint8_t **)&image_data, 0);
-			filter->mask_width = (uint32_t)width;
-			filter->mask_height = (uint32_t)height;
-			stbi_image_free(image_data);
-		} else {
-			blog(LOG_WARNING, "[Luma Wipe 2026] Failed to load mask: %s", filter->mask_path);
+		struct load_data *ld = bzalloc(sizeof(*ld));
+		ld->weak_source = obs_source_get_weak_source(filter->source);
+		ld->path = bstrdup(filter->mask_path);
+
+		os_atomic_set_bool(&filter->is_loading, true);
+		os_task_queue_queue_task(filter->load_queue, luma_wipe_load_task, ld);
+	} else {
+		obs_enter_graphics();
+		if (filter->mask_texture) {
+			gs_texture_destroy(filter->mask_texture);
+			filter->mask_texture = NULL;
+			filter->mask_width = 0;
+			filter->mask_height = 0;
 		}
+		obs_leave_graphics();
 	}
-	obs_leave_graphics();
 }
 
 static void luma_wipe_get_defaults(obs_data_t *settings)
@@ -102,6 +150,8 @@ static void *luma_wipe_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct luma_wipe_info *filter = bzalloc(sizeof(struct luma_wipe_info));
 	filter->source = source;
+	filter->load_queue = os_task_queue_create();
+	pthread_mutex_init(&filter->data_mutex, NULL);
 
 	char *effect_path = obs_module_file("luma_wipe.effect");
 	if (effect_path) {
@@ -142,17 +192,117 @@ static void luma_wipe_destroy(void *data)
 {
 	struct luma_wipe_info *filter = data;
 
+	os_task_queue_destroy(filter->load_queue);
+
 	obs_enter_graphics();
 	if (filter->mask_texture) {
 		gs_texture_destroy(filter->mask_texture);
+	}
+	if (filter->staging_texture) {
+		gs_texture_destroy(filter->staging_texture);
 	}
 	if (filter->effect) {
 		gs_effect_destroy(filter->effect);
 	}
 	obs_leave_graphics();
 
+	pthread_mutex_destroy(&filter->data_mutex);
+	stbi_image_free(filter->pending_mask_data);
+	stbi_image_free(filter->working_mask_data);
 	bfree(filter->mask_path);
 	bfree(filter);
+}
+
+static void luma_wipe_video_tick(void *data, float seconds)
+{
+	struct luma_wipe_info *filter = data;
+	UNUSED_PARAMETER(seconds);
+
+	if (os_atomic_load_bool(&filter->has_new_data)) {
+		pthread_mutex_lock(&filter->data_mutex);
+		obs_enter_graphics();
+
+		if (filter->working_mask_data) {
+			stbi_image_free(filter->working_mask_data);
+		}
+
+		filter->working_mask_data = filter->pending_mask_data;
+		filter->pending_mask_data = NULL;
+
+		if (filter->mask_texture)
+			gs_texture_destroy(filter->mask_texture);
+
+		// Create the large texture empty
+		filter->mask_texture =
+			gs_texture_create(filter->pending_width, filter->pending_height, GS_R16, 1, NULL, 0);
+		filter->mask_width = filter->pending_width;
+		filter->mask_height = filter->pending_height;
+
+		filter->upload_y = 0;
+		filter->is_progressive_uploading = true;
+		os_atomic_set_bool(&filter->has_new_data, false);
+
+		obs_leave_graphics();
+		pthread_mutex_unlock(&filter->data_mutex);
+	}
+
+	if (filter->is_progressive_uploading) {
+		const uint32_t chunk_size = 256;
+
+		pthread_mutex_lock(&filter->data_mutex);
+
+		if (filter->working_mask_data) {
+			uint32_t rows_left = filter->mask_height - filter->upload_y;
+			uint32_t rows_to_copy = (rows_left < chunk_size) ? rows_left : chunk_size;
+
+			obs_enter_graphics();
+
+			// Recreate staging texture if needed
+			if (!filter->staging_texture ||
+			    gs_texture_get_width(filter->staging_texture) != filter->mask_width ||
+			    gs_texture_get_height(filter->staging_texture) != chunk_size) {
+				if (filter->staging_texture)
+					gs_texture_destroy(filter->staging_texture);
+				filter->staging_texture =
+					gs_texture_create(filter->mask_width, chunk_size, GS_R16, 1, NULL, GS_DYNAMIC);
+			}
+
+			if (filter->staging_texture && filter->mask_texture) {
+				uint8_t *ptr;
+				uint32_t linesize_out;
+				if (gs_texture_map(filter->staging_texture, &ptr, &linesize_out)) {
+					const uint8_t *src_data =
+						(const uint8_t *)(filter->working_mask_data +
+								  filter->upload_y * filter->mask_width);
+					uint32_t linesize_in = filter->mask_width * 2;
+					for (uint32_t y = 0; y < rows_to_copy; y++) {
+						memcpy(ptr + y * linesize_out, src_data + y * linesize_in, linesize_in);
+					}
+					gs_texture_unmap(filter->staging_texture);
+
+					gs_copy_texture_region(filter->mask_texture, 0, filter->upload_y,
+							       filter->staging_texture, 0, 0, filter->mask_width,
+							       rows_to_copy);
+				}
+			}
+
+			filter->upload_y += rows_to_copy;
+
+			if (filter->upload_y >= filter->mask_height) {
+				filter->is_progressive_uploading = false;
+				stbi_image_free(filter->working_mask_data);
+				filter->working_mask_data = NULL;
+				os_atomic_set_bool(&filter->is_loading, false);
+			}
+
+			obs_leave_graphics();
+		} else {
+			// Should not happen if is_progressive_uploading is true
+			filter->is_progressive_uploading = false;
+		}
+
+		pthread_mutex_unlock(&filter->data_mutex);
+	}
 }
 
 static void luma_wipe_callback(void *data, gs_texture_t *a, gs_texture_t *b, float t, uint32_t cx, uint32_t cy)
@@ -323,6 +473,7 @@ struct obs_source_info luma_wipe_info = {
 	.destroy = luma_wipe_destroy,
 	.update = luma_wipe_update,
 	.get_defaults = luma_wipe_get_defaults,
+	.video_tick = luma_wipe_video_tick,
 	.video_render = luma_wipe_video_render,
 	.audio_render = luma_wipe_audio_render,
 	.get_properties = luma_wipe_get_properties,
